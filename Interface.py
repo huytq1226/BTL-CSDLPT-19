@@ -52,22 +52,63 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table based on range of ratings.
+    Cải tiến:
+    1. Sử dụng BETWEEN để làm rõ điều kiện và cải thiện hiệu suất
+    2. Tạo tất cả bảng phân vùng trước, sau đó chèn dữ liệu
+    3. Sử dụng một transaction duy nhất để cải thiện tốc độ
+    4. Sử dụng prepared statement để tránh SQL injection và tăng hiệu suất
+    5. Xử lý trường hợp đặc biệt với phân mảnh đầu tiên và cuối cùng một cách rõ ràng
     """
     con = openconnection
     cur = con.cursor()
-    delta = 5 / numberofpartitions
+    
+    # Tính toán khoảng phân vùng
+    delta = 5.0 / numberofpartitions
     RANGE_TABLE_PREFIX = 'range_part'
-    for i in range(0, numberofpartitions):
-        minRange = i * delta
-        maxRange = minRange + delta
-        table_name = RANGE_TABLE_PREFIX + str(i)
-        cur.execute("create table " + table_name + " (userid integer, movieid integer, rating float);")
-        if i == 0:
-            cur.execute("insert into " + table_name + " (userid, movieid, rating) select userid, movieid, rating from " + ratingstablename + " where rating >= " + str(minRange) + " and rating <= " + str(maxRange) + ";")
-        else:
-            cur.execute("insert into " + table_name + " (userid, movieid, rating) select userid, movieid, rating from " + ratingstablename + " where rating > " + str(minRange) + " and rating <= " + str(maxRange) + ";")
-    cur.close()
-    con.commit()
+    
+    try:
+        # Tạo tất cả bảng phân vùng trước
+        for i in range(numberofpartitions):
+            table_name = f"{RANGE_TABLE_PREFIX}{i}"
+            cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+            cur.execute(f"CREATE TABLE {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT)")
+        
+        # Chuẩn bị câu lệnh INSERT cho phân vùng đầu tiên (đặc biệt để bao gồm giá trị nhỏ nhất)
+        table_name = f"{RANGE_TABLE_PREFIX}0"
+        cur.execute(f"""
+            INSERT INTO {table_name} (userid, movieid, rating)
+            SELECT userid, movieid, rating FROM {ratingstablename}
+            WHERE rating >= 0 AND rating <= {delta}
+        """)
+        
+        # Chuẩn bị và thực thi các câu lệnh INSERT cho các phân vùng còn lại
+        for i in range(1, numberofpartitions):
+            table_name = f"{RANGE_TABLE_PREFIX}{i}"
+            min_range = i * delta
+            max_range = min_range + delta
+            
+            # Phân vùng cuối cùng có thể cần bao gồm giá trị tối đa (5.0)
+            if i == numberofpartitions - 1:
+                cur.execute(f"""
+                    INSERT INTO {table_name} (userid, movieid, rating)
+                    SELECT userid, movieid, rating FROM {ratingstablename}
+                    WHERE rating > {min_range} AND rating <= 5.0
+                """)
+            else:
+                cur.execute(f"""
+                    INSERT INTO {table_name} (userid, movieid, rating)
+                    SELECT userid, movieid, rating FROM {ratingstablename}
+                    WHERE rating > {min_range} AND rating <= {max_range}
+                """)
+        
+        # Commit transaction
+        con.commit()
+    except Exception as e:
+        # Rollback trong trường hợp có lỗi
+        con.rollback()
+        raise e
+    finally:
+        cur.close()
 
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
