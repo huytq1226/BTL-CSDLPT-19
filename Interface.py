@@ -6,6 +6,7 @@
 import psycopg2
 from psycopg2.extensions import AsIs
 import logging
+import os
 from io import StringIO
 logging.basicConfig(level=logging.INFO)
 
@@ -19,7 +20,6 @@ def getopenconnection(user='postgres', password='1234', dbname='postgres'):
 def loadratings(ratingstablename, ratingsfilepath, openconnection): 
     """
     Function to load data in @ratingsfilepath file to a table called @ratingstablename.
-    Ultra-optimized version using stream processing and batch loading with StringIO.
     """
     create_db(DATABASE_NAME)
     conn = openconnection
@@ -143,7 +143,6 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table using round robin approach.
-    Ultra-fast implementation with optimized partition creation and insertion.
     """
     conn = openconnection
     cur = conn.cursor()
@@ -195,96 +194,89 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Function to insert a new row into the main table and specific partition based on round robin
-    approach. Optimized version with improved query performance while maintaining test compatibility.
-    
-    Optimizations:
-    1. Sử dụng f-strings thay vì nối chuỗi để cải thiện hiệu suất và dễ đọc
-    2. Sử dụng prepared statements để tránh SQL injection và cải thiện hiệu suất
-    3. Xử lý lỗi với try-except để đảm bảo tính ổn định
-    4. Đảm bảo tương thích với bộ kiểm thử bằng cách giữ nguyên logic ban đầu
+    Function to insert a new row into the main table and specific partition based on round robin approach.
     """
-    # Sử dụng một transaction duy nhất cho tất cả các thao tác
-    con = openconnection
-    cur = con.cursor()
+    conn = openconnection
+    cur = conn.cursor()
     RROBIN_TABLE_PREFIX = 'rrobin_part'
     
     try:
-        # Chèn vào bảng chính - giữ nguyên trình tự thao tác để đảm bảo tương thích với bộ kiểm thử
-        insert_query = f"INSERT INTO {ratingstablename}(userid, movieid, rating) VALUES (%s, %s, %s)"
-        cur.execute(insert_query, (userid, itemid, rating))
+        # Tính toán partition index - sử dụng rr_index.txt
+        if not os.path.exists("rr_index.txt"):
+            save_rr_index(0)
         
-        # Lấy số lượng hàng - phải thực hiện riêng để đảm bảo tương thích với bộ kiểm thử
-        count_query = f"SELECT COUNT(*) FROM {ratingstablename}"
-        cur.execute(count_query)
-        total_rows = cur.fetchone()[0]
-        
-        # Xác định số lượng phân vùng và tính toán chỉ số
+        current_index = get_rr_index()
         numberofpartitions = count_partitions(RROBIN_TABLE_PREFIX, openconnection)
-        index = (total_rows-1) % numberofpartitions
-        table_name = f"{RROBIN_TABLE_PREFIX}{index}"
+        target_partition = current_index % numberofpartitions
         
-        # Chèn vào phân vùng tương ứng
-        partition_insert_query = f"INSERT INTO {table_name}(userid, movieid, rating) VALUES (%s, %s, %s)"
-        cur.execute(partition_insert_query, (userid, itemid, rating))
+        # Sử dụng một transaction duy nhất
+        cur.execute("""
+            INSERT INTO {} (userid, movieid, rating) VALUES (%s, %s, %s);
+        """.format(ratingstablename), (userid, itemid, rating))
         
-        # Commit transaction
-        con.commit()
+        cur.execute("""
+            INSERT INTO {} (userid, movieid, rating) VALUES (%s, %s, %s);
+        """.format(f"{RROBIN_TABLE_PREFIX}{target_partition}"), (userid, itemid, rating))
+        
+        # Tăng index và lưu vào file
+        save_rr_index(current_index + 1)
+        
+        conn.commit()
     except Exception as e:
-        # Rollback trong trường hợp có lỗi
-        con.rollback()
-        raise e
+        conn.rollback()
+        print(f"Error in roundrobininsert: {e}")
+        raise
     finally:
-        # Đảm bảo cursor luôn được đóng
         cur.close()
+
 
 def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
     Function to insert a new row into the main table and specific partition based on range rating.
-    Optimized version with better performance and correct logic.
     """
-    con = openconnection
-    cur = con.cursor()
+    conn = openconnection
+    cur = conn.cursor()
     RANGE_TABLE_PREFIX = 'range_part'
     
     try:
-        # Insert vào bảng chính trước
-        cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s)", 
+        # Insert vào bảng chính
+        cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s)",
                    (userid, itemid, rating))
         
         # Tính toán partition index
         numberofpartitions = count_partitions(RANGE_TABLE_PREFIX, openconnection)
+        if numberofpartitions <= 0:
+            raise ValueError("No range partitions found")
+            
         delta = 5.0 / numberofpartitions
         
-        # Logic tính index phải đồng nhất với cách rangepartition phân vùng dữ liệu
+        # Xác định index của partition một cách tối ưu
         if rating == 0.0:
-            # Giá trị biên dưới (0.0) luôn thuộc phân vùng đầu tiên
+            # Edge case cho giá trị 0.0
             index = 0
         elif rating == 5.0:
-            # Giá trị biên trên (5.0) thuộc về phân vùng cuối cùng
-            # Điều này đồng nhất với cách rangepartition đưa giá trị 5.0 vào phân vùng cuối
+            # Edge case cho giá trị 5.0
             index = numberofpartitions - 1
         else:
-            # Các giá trị khác
+            # Các giá trị thông thường
             index = int(rating / delta)
-            # Giá trị nằm đúng tại biên giữa các phân vùng (trừ 0.0 và 5.0)
-            # thuộc về phân vùng phía dưới
-            if rating > 0 and rating % delta == 0:
+            # Xử lý trường hợp rating nằm đúng biên giữa các khoảng
+            if rating > 0 and index > 0 and abs(rating - index * delta) < 1e-9:
                 index = index - 1
+            
+            # Đảm bảo index nằm trong khoảng hợp lệ
+            index = min(index, numberofpartitions - 1)
         
-        # Đảm bảo index trong phạm vi hợp lệ
-        index = max(0, min(index, numberofpartitions - 1))
-        
+        # Insert vào partition tương ứng
         table_name = f"{RANGE_TABLE_PREFIX}{index}"
-        
-        # Insert vào partition tương ứng với prepared statement
-        cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES (%s, %s, %s)", 
+        cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES (%s, %s, %s)",
                    (userid, itemid, rating))
         
-        con.commit()
+        conn.commit()
     except Exception as e:
-        con.rollback()
-        raise e
+        conn.rollback()
+        print(f"Error in rangeinsert: {e}")
+        raise
     finally:
         cur.close()
 
