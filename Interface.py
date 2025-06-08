@@ -143,39 +143,55 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table using round robin approach.
-    Optimized version with better performance.
+    Ultra-fast implementation with optimized partition creation and insertion.
     """
-    con = openconnection
-    cur = con.cursor()
+    conn = openconnection
+    cur = conn.cursor()
     RROBIN_TABLE_PREFIX = 'rrobin_part'
     
-    # Tạo tất cả các bảng trước
-    for i in range(numberofpartitions):
-        table_name = f"{RROBIN_TABLE_PREFIX}{i}"
-        cur.execute(f"CREATE TABLE {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT)")
-    
-    # Sử dụng một query duy nhất với CTE để phân chia dữ liệu
-    # Tạo danh sách CASE WHEN statements cho từng partition
-    case_statements = []
-    for i in range(numberofpartitions):
-        table_name = f"{RROBIN_TABLE_PREFIX}{i}"
-        case_statements.append(f"WHEN {i} THEN '{table_name}'")
-    
-    # Thực hiện insert bằng cách sử dụng ROW_NUMBER() một lần duy nhất
-    for i in range(numberofpartitions):
-        table_name = f"{RROBIN_TABLE_PREFIX}{i}"
-        cur.execute(f"""
-            INSERT INTO {table_name} (userid, movieid, rating) 
-            SELECT userid, movieid, rating 
-            FROM (
-                SELECT userid, movieid, rating, ROW_NUMBER() OVER() as rnum 
-                FROM {ratingstablename}
-            ) AS temp 
-            WHERE MOD(temp.rnum-1, {numberofpartitions}) = {i}
-        """)
-    
-    cur.close()
-    con.commit()
+    try:
+        # Tạo tất cả bảng partition trong một câu lệnh
+        create_tables_sql = []
+        for i in range(numberofpartitions):
+            create_tables_sql.append(f"""
+                DROP TABLE IF EXISTS {RROBIN_TABLE_PREFIX}{i};
+                CREATE TABLE {RROBIN_TABLE_PREFIX}{i} (userid INTEGER, movieid INTEGER, rating FLOAT);
+            """)
+        
+        cur.execute(";".join(create_tables_sql))
+        conn.commit()
+        
+        # Lấy tổng số dòng để tính partition
+        cur.execute(f"SELECT COUNT(*) FROM {ratingstablename}")
+        total_rows = cur.fetchone()[0]
+        
+        # Nếu không có dòng, không cần phân vùng
+        if total_rows == 0:
+            save_rr_index(0)
+            return
+        
+        # Sử dụng INSERT với MOD để phân vùng dữ liệu
+        for i in range(numberofpartitions):
+            cur.execute(f"""
+                INSERT INTO {RROBIN_TABLE_PREFIX}{i} (userid, movieid, rating)
+                SELECT userid, movieid, rating 
+                FROM (
+                    SELECT userid, movieid, rating, 
+                           ROW_NUMBER() OVER() AS rn 
+                    FROM {ratingstablename}
+                ) t
+                WHERE MOD(rn - 1, {numberofpartitions}) = {i}
+            """)
+        
+        # Khởi tạo file rr_index.txt
+        save_rr_index(total_rows % numberofpartitions)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Error in roundrobinpartition: {e}")
+        raise
+    finally:
+        cur.close()
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """
@@ -306,3 +322,17 @@ def count_partitions(prefix, openconnection):
     cur.close()
 
     return count
+
+def get_rr_index():
+    """Get the current index for round robin insert"""
+    try:
+        with open("rr_index.txt", 'r') as f:
+            return int(f.read().strip())
+    except:
+        return 0
+
+
+def save_rr_index(index):
+    """Save the current index for round robin insert"""
+    with open("rr_index.txt", 'w') as f:
+        f.write(str(index))
