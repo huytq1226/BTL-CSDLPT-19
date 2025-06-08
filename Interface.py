@@ -80,59 +80,28 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table based on range of ratings.
-    Cải tiến:
-    1. Tối ưu hiệu suất bằng cách tạo chỉ mục trên cột rating trước khi phân vùng
-    2. Sử dụng prepared statements để ngăn chặn SQL injection
-    3. Kiểm tra đầu vào và xử lý các trường hợp đặc biệt
-    4. Sử dụng một transaction duy nhất cho tất cả thao tác
-    5. Tạo tất cả bảng phân vùng trước, sau đó thực hiện chèn dữ liệu
     """
-    con = openconnection
-    cur = con.cursor()
+    conn = openconnection
+    cur = conn.cursor()
     RANGE_TABLE_PREFIX = 'range_part'
     
     # Kiểm tra đầu vào
     if not isinstance(numberofpartitions, int) or numberofpartitions <= 0:
         raise ValueError("numberofpartitions phải là số nguyên dương")
     
-    # Kiểm tra bảng có tồn tại không
-    cur.execute(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{ratingstablename}')")
-    if not cur.fetchone()[0]:
-        raise ValueError(f"Bảng '{ratingstablename}' không tồn tại")
-    
-    # Kiểm tra bảng có dữ liệu không
-    cur.execute(f"SELECT COUNT(*) FROM {ratingstablename}")
-    if cur.fetchone()[0] == 0:
-        # Nếu bảng rỗng, vẫn tạo các partition nhưng không cần chèn dữ liệu
-        for i in range(numberofpartitions):
-            table_name = f"{RANGE_TABLE_PREFIX}{i}"
-            cur.execute(f"DROP TABLE IF EXISTS {table_name}")
-            cur.execute(f"CREATE TABLE {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT)")
-        con.commit()
-        cur.close()
-        return
-    
     # Tính toán khoảng phân vùng
     delta = 5.0 / numberofpartitions
     
     try:
-        # Tạo chỉ mục tạm thời trên cột rating nếu chưa có để tăng tốc các truy vấn WHERE
-        cur.execute(f"""
-            SELECT COUNT(*) FROM pg_indexes 
-            WHERE tablename = '{ratingstablename}' AND indexname LIKE '%_rating_%'
-        """)
-        
-        if cur.fetchone()[0] == 0:
-            idx_name = f"temp_idx_{ratingstablename}_rating"
-            cur.execute(f"CREATE INDEX {idx_name} ON {ratingstablename}(rating)")
-        
-        # Tạo tất cả bảng phân vùng trước
+        # Xóa và tạo lại các bảng partition
         for i in range(numberofpartitions):
             table_name = f"{RANGE_TABLE_PREFIX}{i}"
             cur.execute(f"DROP TABLE IF EXISTS {table_name}")
             cur.execute(f"CREATE TABLE {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT)")
         
-        # Chuẩn bị câu lệnh INSERT cho phân vùng đầu tiên (đặc biệt để bao gồm giá trị nhỏ nhất)
+        conn.commit()
+        
+        # Phân vùng đầu tiên (0) - bao gồm giá trị 0
         table_name = f"{RANGE_TABLE_PREFIX}0"
         cur.execute(f"""
             INSERT INTO {table_name} (userid, movieid, rating)
@@ -140,42 +109,34 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
             WHERE rating >= 0 AND rating <= {delta}
         """)
         
-        # Chuẩn bị và thực thi các câu lệnh INSERT cho các phân vùng còn lại
-        for i in range(1, numberofpartitions):
+        # Các phân vùng 1 đến n-2
+        for i in range(1, numberofpartitions-1):
             table_name = f"{RANGE_TABLE_PREFIX}{i}"
             min_range = i * delta
-            max_range = min_range + delta
+            max_range = (i + 1) * delta
             
-            # Phân vùng cuối cùng có thể cần bao gồm giá trị tối đa (5.0)
-            if i == numberofpartitions - 1:
-                cur.execute(f"""
-                    INSERT INTO {table_name} (userid, movieid, rating)
-                    SELECT userid, movieid, rating FROM {ratingstablename}
-                    WHERE rating > {min_range} AND rating <= 5.0
-                """)
-            else:
-                cur.execute(f"""
-                    INSERT INTO {table_name} (userid, movieid, rating)
-                    SELECT userid, movieid, rating FROM {ratingstablename}
-                    WHERE rating > {min_range} AND rating <= {max_range}
-                """)
+            cur.execute(f"""
+                INSERT INTO {table_name} (userid, movieid, rating)
+                SELECT userid, movieid, rating FROM {ratingstablename}
+                WHERE rating > {min_range} AND rating <= {max_range}
+            """)
         
-        # Xóa chỉ mục tạm thời nếu đã tạo
-        cur.execute(f"""
-            SELECT indexname FROM pg_indexes 
-            WHERE tablename = '{ratingstablename}' AND indexname LIKE 'temp_idx_%'
-        """)
-        temp_indexes = cur.fetchall()
-        for idx in temp_indexes:
-            if idx[0].startswith('temp_idx_'):
-                cur.execute(f"DROP INDEX {idx[0]}")
+        # Phân vùng cuối cùng - bao gồm giá trị 5.0
+        if numberofpartitions > 1:
+            table_name = f"{RANGE_TABLE_PREFIX}{numberofpartitions-1}"
+            min_range = (numberofpartitions - 1) * delta
+            
+            cur.execute(f"""
+                INSERT INTO {table_name} (userid, movieid, rating)
+                SELECT userid, movieid, rating FROM {ratingstablename}
+                WHERE rating > {min_range} AND rating <= 5.0
+            """)
         
-        # Commit transaction
-        con.commit()
+        conn.commit()
     except Exception as e:
-        # Rollback trong trường hợp có lỗi
-        con.rollback()
-        raise e
+        conn.rollback()
+        print(f"Error in rangepartition: {e}")
+        raise
     finally:
         cur.close()
 
