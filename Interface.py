@@ -6,7 +6,7 @@
 import psycopg2
 from psycopg2.extensions import AsIs
 import logging
-import time
+from io import StringIO
 logging.basicConfig(level=logging.INFO)
 
 DATABASE_NAME = 'dds_assgn1'
@@ -19,38 +19,62 @@ def getopenconnection(user='postgres', password='1234', dbname='postgres'):
 def loadratings(ratingstablename, ratingsfilepath, openconnection): 
     """
     Function to load data in @ratingsfilepath file to a table called @ratingstablename.
-    Optimized version using temporary table to avoid ALTER TABLE operations.
+    Ultra-optimized version using stream processing and batch loading with StringIO.
     """
     create_db(DATABASE_NAME)
-    con = openconnection
-    cur = con.cursor()
+    conn = openconnection
+    cur = conn.cursor()
     
-    # Xóa bảng đích nếu tồn tại
-    cur.execute("DROP TABLE IF EXISTS " + ratingstablename)
-    
-    # Tạo bảng đích với cấu trúc cuối cùng
-    cur.execute("CREATE TABLE " + ratingstablename + " (userid INTEGER, movieid INTEGER, rating FLOAT)")
-    
-    # Tạo bảng tạm thời để nhận dữ liệu từ file
-    temp_table = ratingstablename + "_temp"
-    cur.execute("DROP TABLE IF EXISTS " + temp_table)
-    cur.execute("CREATE TEMPORARY TABLE " + temp_table + 
-                " (userid INTEGER, extra1 CHAR, movieid INTEGER, extra2 CHAR, " +
-                "rating FLOAT, extra3 CHAR, timestamp BIGINT)")
-    
-    # Sử dụng COPY để tải dữ liệu vào bảng tạm thời
-    with open(ratingsfilepath, 'r') as file:
-        cur.copy_from(file, temp_table, sep=':')
-    
-    # Chèn dữ liệu từ bảng tạm thời vào bảng đích
-    cur.execute("INSERT INTO " + ratingstablename + " (userid, movieid, rating) " +
-                "SELECT userid, movieid, rating FROM " + temp_table)
-    
-    # Xóa bảng tạm thời (không cần thiết vì bảng tạm thời sẽ tự động bị xóa khi phiên kết thúc)
-    cur.execute("DROP TABLE IF EXISTS " + temp_table)
-    
-    cur.close()
-    con.commit()
+    try:
+        # Tạo bảng đích trực tiếp với cấu trúc cuối cùng
+        cur.execute(f"""
+            DROP TABLE IF EXISTS {ratingstablename};
+            CREATE TABLE {ratingstablename} (
+                userid INTEGER,
+                movieid INTEGER,
+                rating FLOAT
+            );
+        """)
+        
+        # Sử dụng COPY command để tải dữ liệu vào bảng - cách nhanh nhất
+        batch_size = 500_000  # Batch lớn hơn để giảm số lần gọi DB
+        buffer = StringIO()
+        count = 0
+        
+        # Xử lý từng dòng và định dạng lại để COPY
+        with open(ratingsfilepath, 'r') as f:
+            for line in f:
+                # Tách và định dạng lại dữ liệu
+                parts = line.strip().split('::')
+                if len(parts) >= 3:
+                    buffer.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\n")
+                    count += 1
+                    
+                    # Đẩy dữ liệu theo batch
+                    if count % batch_size == 0:
+                        buffer.seek(0)
+                        cur.copy_expert(
+                            f"COPY {ratingstablename} (userid, movieid, rating) FROM STDIN WITH DELIMITER E'\t'",
+                            buffer
+                        )
+                        buffer.truncate(0)
+                        buffer.seek(0)
+        
+        # Xử lý phần còn lại
+        if buffer.tell() > 0:
+            buffer.seek(0)
+            cur.copy_expert(
+                f"COPY {ratingstablename} (userid, movieid, rating) FROM STDIN WITH DELIMITER E'\t'",
+                buffer
+            )
+        
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Error in loadratings: {e}")
+        raise
+    finally:
+        cur.close()
 
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
