@@ -104,7 +104,7 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
         raise ValueError("numberofpartitions phải là số nguyên dương")
     
     # Tính toán khoảng phân vùng
-    delta = 5.0 / numberofpartitions
+    interval = 5.0 / numberofpartitions
     
     try:
         # Xóa và tạo lại các bảng partition
@@ -120,14 +120,14 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
         cur.execute(f"""
             INSERT INTO {table_name} (userid, movieid, rating)
             SELECT userid, movieid, rating FROM {ratingstablename}
-            WHERE rating >= 0 AND rating <= {delta}
+            WHERE rating >= 0 AND rating <= {interval}
         """)
         
         # Các phân vùng 1 đến n-2
         for i in range(1, numberofpartitions-1):
             table_name = f"{RANGE_TABLE_PREFIX}{i}"
-            min_range = i * delta
-            max_range = (i + 1) * delta
+            min_range = i * interval
+            max_range = (i + 1) * interval
             
             cur.execute(f"""
                 INSERT INTO {table_name} (userid, movieid, rating)
@@ -135,10 +135,10 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
                 WHERE rating > {min_range} AND rating <= {max_range}
             """)
         
-        # Phân vùng cuối cùng - bao gồm giá trị 5.0
+        # Phân vùng cuối cùng (n-1) - bao gồm giá trị 5.0
         if numberofpartitions > 1:
             table_name = f"{RANGE_TABLE_PREFIX}{numberofpartitions-1}"
-            min_range = (numberofpartitions - 1) * delta
+            min_range = (numberofpartitions - 1) * interval
             
             cur.execute(f"""
                 INSERT INTO {table_name} (userid, movieid, rating)
@@ -155,51 +155,51 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
         cur.close()
         log_execution_time("rangepartition", start_time)
 
+
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table using round robin approach.
-    Uses direct SQL partition queries for better performance.
     """
     start_time = time.time()
-    # Reset rr_index for new partitioning
-    save_rr_index(0)
-    
-    # Get connection and cursor
     conn = openconnection
     cur = conn.cursor()
-    
+    RROBIN_TABLE_PREFIX = 'rrobin_part'
     try:
-        # Create partition tables
+        # Tạo tất cả bảng partition trong một câu lệnh
+        create_tables_sql = []
         for i in range(numberofpartitions):
-            table_name = f"rrobin_part{i}"
-            # Drop if exists and recreate
-            cur.execute(f"DROP TABLE IF EXISTS {table_name};")
-            cur.execute(f"""
-                CREATE TABLE {table_name} (
-                    userid INTEGER,
-                    movieid INTEGER,
-                    rating FLOAT
-                );
+            create_tables_sql.append(f"""
+                DROP TABLE IF EXISTS {RROBIN_TABLE_PREFIX}{i};
+                CREATE TABLE {RROBIN_TABLE_PREFIX}{i} (userid INTEGER, movieid INTEGER, rating FLOAT);
             """)
         
-        # Directly populate partitions using SQL
+        cur.execute(";".join(create_tables_sql))
+        conn.commit()
+        
+        # Lấy tổng số dòng để tính partition
+        cur.execute(f"SELECT COUNT(*) FROM {ratingstablename}")
+        total_rows = cur.fetchone()[0]
+        
+        # Nếu không có dòng, không cần phân vùng
+        if total_rows == 0:
+            save_rr_index(0)
+            return
+        
+        # Sử dụng INSERT với MOD để phân vùng dữ liệu
         for i in range(numberofpartitions):
-            table_name = f"rrobin_part{i}"
-            # Use the MOD function to distribute rows evenly
             cur.execute(f"""
-                INSERT INTO {table_name} (userid, movieid, rating)
+                INSERT INTO {RROBIN_TABLE_PREFIX}{i} (userid, movieid, rating)
                 SELECT userid, movieid, rating 
                 FROM (
-                    SELECT 
-                        userid, 
-                        movieid, 
-                        rating,
-                        ROW_NUMBER() OVER(ORDER BY userid) AS rn
+                    SELECT userid, movieid, rating, 
+                           ROW_NUMBER() OVER() AS rn 
                     FROM {ratingstablename}
-                ) AS t
-                WHERE MOD(t.rn - 1, {numberofpartitions}) = {i}
+                ) t
+                WHERE MOD(rn - 1, {numberofpartitions}) = {i}
             """)
         
+        # Khởi tạo file rr_index.txt
+        save_rr_index(total_rows % numberofpartitions)
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -211,51 +211,34 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Function to insert a row in a round-robin fashion.
-    Uses stored file to track current partition index.
+    Function to insert a new row into the main table and specific partition based on round robin approach.
     """
     start_time = time.time()
     conn = openconnection
     cur = conn.cursor()
+    RROBIN_TABLE_PREFIX = 'rrobin_part'
     
     try:
-        # First, insert the record into the main ratings table
-        cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s)",
-                   (userid, itemid, rating))
+        # Tính toán partition index - sử dụng rr_index.txt
+        if not os.path.exists("rr_index.txt"):
+            save_rr_index(0)
         
-        # Count number of round-robin partitions
-        # This approach uses a direct count instead of information_schema
-        cur.execute("SELECT COUNT(*) FROM pg_stat_user_tables WHERE relname LIKE 'rrobin_part%'")
-        num_partitions = cur.fetchone()[0]
+        current_index = get_rr_index()
+        numberofpartitions = count_partitions(RROBIN_TABLE_PREFIX, openconnection)
+        target_partition = current_index % numberofpartitions
         
-        if num_partitions == 0:
-            # No partitions exist, create the first one
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS rrobin_part0 (
-                    userid INTEGER,
-                    movieid INTEGER,
-                    rating FLOAT
-                )
-            """)
-            num_partitions = 1
+        # Sử dụng một transaction duy nhất
+        cur.execute("""
+            INSERT INTO {} (userid, movieid, rating) VALUES (%s, %s, %s);
+        """.format(ratingstablename), (userid, itemid, rating))
         
-        # Get the current index for round-robin insertion
-        next_part_index = get_rr_index()
+        cur.execute("""
+            INSERT INTO {} (userid, movieid, rating) VALUES (%s, %s, %s);
+        """.format(f"{RROBIN_TABLE_PREFIX}{target_partition}"), (userid, itemid, rating))
         
-        # Determine which partition to insert into
-        target_partition = next_part_index % num_partitions
+        # Tăng index và lưu vào file
+        save_rr_index(current_index + 1)
         
-        # Insert into target partition
-        target_table = f"rrobin_part{target_partition}"
-        cur.execute(f"""
-            INSERT INTO {target_table} (userid, movieid, rating)
-            VALUES (%s, %s, %s)
-        """, (userid, itemid, rating))
-        
-        # Update the index for next insertion
-        save_rr_index(next_part_index + 1)
-        
-        # Commit the transaction
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -285,27 +268,26 @@ def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
         if numberofpartitions <= 0:
             raise ValueError("No range partitions found")
             
-        delta = 5.0 / numberofpartitions
+        interval = 5.0 / numberofpartitions
         
-        # Xác định index của partition một cách tối ưu
-        if rating == 0.0:
-            # Edge case cho giá trị 0.0
-            index = 0
+        # Xác định partition dựa vào rating
+        target_partition = 0
+        
+        if rating == 0:
+            target_partition = 0
         elif rating == 5.0:
-            # Edge case cho giá trị 5.0
-            index = numberofpartitions - 1
+            target_partition = numberofpartitions - 1
         else:
-            # Các giá trị thông thường
-            index = int(rating / delta)
-            # Xử lý trường hợp rating nằm đúng biên giữa các khoảng
-            if rating > 0 and index > 0 and abs(rating - index * delta) < 1e-9:
-                index = index - 1
-            
-            # Đảm bảo index nằm trong khoảng hợp lệ
-            index = min(index, numberofpartitions - 1)
+            for i in range(numberofpartitions):
+                min_val = i * interval
+                max_val = (i + 1) * interval if i < numberofpartitions - 1 else 5.0
+                
+                if min_val < rating <= max_val:
+                    target_partition = i
+                    break
         
         # Insert vào partition tương ứng
-        table_name = f"{RANGE_TABLE_PREFIX}{index}"
+        table_name = f"{RANGE_TABLE_PREFIX}{target_partition}"
         cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES (%s, %s, %s)",
                    (userid, itemid, rating))
         
