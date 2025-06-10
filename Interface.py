@@ -5,22 +5,34 @@
 
 import psycopg2
 from psycopg2.extensions import AsIs
+from psycopg2.sql import SQL, Identifier, Literal
 import logging
 import os
 from io import StringIO
+import time  # Import time module for logging execution time
+
 logging.basicConfig(level=logging.INFO)
 
 DATABASE_NAME = 'dds_assgn1'
 
+# Helper function to log execution time
+def log_execution_time(func_name, start_time):
+    end_time = time.time()
+    execution_time = end_time - start_time
+    logging.info(f"Function {func_name} completed in {execution_time:.4f} seconds")
 
 def getopenconnection(user='postgres', password='1234', dbname='postgres'):
-    return psycopg2.connect("dbname='" + dbname + "' user='" + user + "' host='localhost' password='" + password + "'")
+    start_time = time.time()
+    connection = psycopg2.connect("dbname='" + dbname + "' user='" + user + "' host='localhost' password='" + password + "'")
+    log_execution_time("getopenconnection", start_time)
+    return connection
 
 
 def loadratings(ratingstablename, ratingsfilepath, openconnection): 
     """
     Function to load data in @ratingsfilepath file to a table called @ratingstablename.
     """
+    start_time = time.time()
     create_db(DATABASE_NAME)
     conn = openconnection
     cur = conn.cursor()
@@ -75,12 +87,14 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
         raise
     finally:
         cur.close()
+        log_execution_time("loadratings", start_time)
 
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table based on range of ratings.
     """
+    start_time = time.time()
     conn = openconnection
     cur = conn.cursor()
     RANGE_TABLE_PREFIX = 'range_part'
@@ -139,51 +153,53 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
         raise
     finally:
         cur.close()
+        log_execution_time("rangepartition", start_time)
 
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table using round robin approach.
+    Uses direct SQL partition queries for better performance.
     """
+    start_time = time.time()
+    # Reset rr_index for new partitioning
+    save_rr_index(0)
+    
+    # Get connection and cursor
     conn = openconnection
     cur = conn.cursor()
-    RROBIN_TABLE_PREFIX = 'rrobin_part'
     
     try:
-        # Tạo tất cả bảng partition trong một câu lệnh
-        create_tables_sql = []
+        # Create partition tables
         for i in range(numberofpartitions):
-            create_tables_sql.append(f"""
-                DROP TABLE IF EXISTS {RROBIN_TABLE_PREFIX}{i};
-                CREATE TABLE {RROBIN_TABLE_PREFIX}{i} (userid INTEGER, movieid INTEGER, rating FLOAT);
+            table_name = f"rrobin_part{i}"
+            # Drop if exists and recreate
+            cur.execute(f"DROP TABLE IF EXISTS {table_name};")
+            cur.execute(f"""
+                CREATE TABLE {table_name} (
+                    userid INTEGER,
+                    movieid INTEGER,
+                    rating FLOAT
+                );
             """)
         
-        cur.execute(";".join(create_tables_sql))
-        conn.commit()
-        
-        # Lấy tổng số dòng để tính partition
-        cur.execute(f"SELECT COUNT(*) FROM {ratingstablename}")
-        total_rows = cur.fetchone()[0]
-        
-        # Nếu không có dòng, không cần phân vùng
-        if total_rows == 0:
-            save_rr_index(0)
-            return
-        
-        # Sử dụng INSERT với MOD để phân vùng dữ liệu
+        # Directly populate partitions using SQL
         for i in range(numberofpartitions):
+            table_name = f"rrobin_part{i}"
+            # Use the MOD function to distribute rows evenly
             cur.execute(f"""
-                INSERT INTO {RROBIN_TABLE_PREFIX}{i} (userid, movieid, rating)
+                INSERT INTO {table_name} (userid, movieid, rating)
                 SELECT userid, movieid, rating 
                 FROM (
-                    SELECT userid, movieid, rating, 
-                           ROW_NUMBER() OVER() AS rn 
+                    SELECT 
+                        userid, 
+                        movieid, 
+                        rating,
+                        ROW_NUMBER() OVER(ORDER BY userid) AS rn
                     FROM {ratingstablename}
-                ) t
-                WHERE MOD(rn - 1, {numberofpartitions}) = {i}
+                ) AS t
+                WHERE MOD(t.rn - 1, {numberofpartitions}) = {i}
             """)
         
-        # Khởi tạo file rr_index.txt
-        save_rr_index(total_rows % numberofpartitions)
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -191,36 +207,55 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
         raise
     finally:
         cur.close()
+        log_execution_time("roundrobinpartition", start_time)
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Function to insert a new row into the main table and specific partition based on round robin approach.
+    Function to insert a row in a round-robin fashion.
+    Uses stored file to track current partition index.
     """
+    start_time = time.time()
     conn = openconnection
     cur = conn.cursor()
-    RROBIN_TABLE_PREFIX = 'rrobin_part'
     
     try:
-        # Tính toán partition index - sử dụng rr_index.txt
-        if not os.path.exists("rr_index.txt"):
-            save_rr_index(0)
+        # First, insert the record into the main ratings table
+        cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s)",
+                   (userid, itemid, rating))
         
-        current_index = get_rr_index()
-        numberofpartitions = count_partitions(RROBIN_TABLE_PREFIX, openconnection)
-        target_partition = current_index % numberofpartitions
+        # Count number of round-robin partitions
+        # This approach uses a direct count instead of information_schema
+        cur.execute("SELECT COUNT(*) FROM pg_stat_user_tables WHERE relname LIKE 'rrobin_part%'")
+        num_partitions = cur.fetchone()[0]
         
-        # Sử dụng một transaction duy nhất
-        cur.execute("""
-            INSERT INTO {} (userid, movieid, rating) VALUES (%s, %s, %s);
-        """.format(ratingstablename), (userid, itemid, rating))
+        if num_partitions == 0:
+            # No partitions exist, create the first one
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS rrobin_part0 (
+                    userid INTEGER,
+                    movieid INTEGER,
+                    rating FLOAT
+                )
+            """)
+            num_partitions = 1
         
-        cur.execute("""
-            INSERT INTO {} (userid, movieid, rating) VALUES (%s, %s, %s);
-        """.format(f"{RROBIN_TABLE_PREFIX}{target_partition}"), (userid, itemid, rating))
+        # Get the current index for round-robin insertion
+        next_part_index = get_rr_index()
         
-        # Tăng index và lưu vào file
-        save_rr_index(current_index + 1)
+        # Determine which partition to insert into
+        target_partition = next_part_index % num_partitions
         
+        # Insert into target partition
+        target_table = f"rrobin_part{target_partition}"
+        cur.execute(f"""
+            INSERT INTO {target_table} (userid, movieid, rating)
+            VALUES (%s, %s, %s)
+        """, (userid, itemid, rating))
+        
+        # Update the index for next insertion
+        save_rr_index(next_part_index + 1)
+        
+        # Commit the transaction
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -228,12 +263,14 @@ def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
         raise
     finally:
         cur.close()
+        log_execution_time("roundrobininsert", start_time)
 
 
 def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
     Function to insert a new row into the main table and specific partition based on range rating.
     """
+    start_time = time.time()
     conn = openconnection
     cur = conn.cursor()
     RANGE_TABLE_PREFIX = 'range_part'
@@ -279,6 +316,7 @@ def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
         raise
     finally:
         cur.close()
+        log_execution_time("rangeinsert", start_time)
 
 def create_db(dbname):
     """
@@ -286,6 +324,7 @@ def create_db(dbname):
     The function first checks if an existing database exists for a given name, else creates it.
     :return:None
     """
+    start_time = time.time()
     # Connect to the default database
     con = getopenconnection(dbname='postgres')
     con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
@@ -302,29 +341,37 @@ def create_db(dbname):
     # Clean up
     cur.close()
     con.close()
+    log_execution_time("create_db", start_time)
 
 def count_partitions(prefix, openconnection):
     """
     Function to count the number of tables which have the @prefix in their name somewhere.
     """
+    start_time = time.time()
     con = openconnection
     cur = con.cursor()
     cur.execute("select count(*) from pg_stat_user_tables where relname like " + "'" + prefix + "%';")
     count = cur.fetchone()[0]
     cur.close()
-
+    log_execution_time("count_partitions", start_time)
     return count
 
 def get_rr_index():
     """Get the current index for round robin insert"""
+    start_time = time.time()
     try:
         with open("rr_index.txt", 'r') as f:
-            return int(f.read().strip())
+            index = int(f.read().strip())
+        log_execution_time("get_rr_index", start_time)
+        return index
     except:
+        log_execution_time("get_rr_index", start_time)
         return 0
 
 
 def save_rr_index(index):
     """Save the current index for round robin insert"""
+    start_time = time.time()
     with open("rr_index.txt", 'w') as f:
         f.write(str(index))
+    log_execution_time("save_rr_index", start_time)
